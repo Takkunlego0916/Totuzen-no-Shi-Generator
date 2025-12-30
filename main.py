@@ -4,7 +4,7 @@ from discord.ext import commands
 from wcwidth import wcswidth
 
 
-TOKEN = "YOUR_BOT_TOKEN_HERE"
+TOKEN = "MTQ1NTM1MzYyMTY0NTM2NTI4OA.G9LZKJ.T9DjUtegp8ccVQM9oDFILoV49oFTAiITzl0cyE"
 GUILD_ID = None  
 
 intents = discord.Intents.default()
