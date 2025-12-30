@@ -24,13 +24,15 @@ def run():
 Thread(target=run).start()
 
 # --- 環境変数読み込み ---
-load_dotenv()  # .env がある場合に読み込む
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # テスト用にサーバー限定登録するなら入れる（省略可）
+GUILD_ID = os.getenv("GUILD_ID")  # テスト用ギルドID。未設定ならグローバル登録
 MAX_WIDTH = int(os.getenv("TOTUZEN_MAX_WIDTH", "40"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # --- ログ設定 ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
 logger = logging.getLogger("totuzen-bot")
 
 # --- Bot 初期化 ---
@@ -42,10 +44,8 @@ def display_width(s: str) -> int:
     return max(0, wcswidth(s))
 
 def truncate_with_ellipsis(s: str, max_w: int) -> str:
-    # 表示幅で切って末尾に…を付ける（必要なら）
     if display_width(s) <= max_w:
         return s
-    # 末尾に '…' を残すために1幅分を確保
     out = ""
     for ch in s:
         if display_width(out + ch + "…") > max_w:
@@ -53,13 +53,17 @@ def truncate_with_ellipsis(s: str, max_w: int) -> str:
         out += ch
     return out + "…"
 
+def sanitize_message(s: str) -> str:
+    # 改行をスペースに、メンションを無効化
+    s = s.replace("\n", " ")
+    s = s.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+    s = s.replace("@", "@\u200b")
+    return s
+
 def make_totuzen_art(message: str, max_width: int = 40) -> str:
-    msg = message.replace("\n", " ")
-    # メンション系を無効化
-    msg = msg.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-    msg = msg.replace("@", "@\u200b")
-    # 切り詰め
-    msg = truncate_with_ellipsis(msg, max_width - 4)  # 両端の全角スペース分を差し引く
+    msg = sanitize_message(message)
+    # 両端の全角スペース分を差し引いて切る
+    msg = truncate_with_ellipsis(msg, max_width - 4)
     inner = f"　{msg}　"  # 全角スペースで囲む
     inner_width = display_width(inner)
     people_count = max(2, inner_width)
@@ -69,17 +73,15 @@ def make_totuzen_art(message: str, max_width: int = 40) -> str:
     bottom = "￣" + "Y^" * y_repeat + "￣"
     return "```\n" + top + "\n" + middle + "\n" + bottom + "\n```"
 
-# --- スラッシュコマンド ---
+# --- スラッシュコマンドの定義を分離して管理する場合は Cog にすることも可能 ---
 @bot.tree.command(name="totuzen", description="突然のアスキーアートでメッセージを表示します")
 @app_commands.describe(message="表示するメッセージ（改行はスペースに変換されます）")
 async def totuzen(interaction: discord.Interaction, message: str):
-    safe = message  # make_totuzen_art 内でサニタイズ済み
-    art = make_totuzen_art(safe, max_width=MAX_WIDTH)
+    art = make_totuzen_art(message, max_width=MAX_WIDTH)
     try:
         await interaction.response.send_message(art)
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to send totuzen response")
-        # 既に応答済みかどうかで処理を分ける
         try:
             if interaction.response.is_done():
                 await interaction.followup.send("送信に失敗しました。", ephemeral=True)
@@ -92,37 +94,44 @@ async def totuzen(interaction: discord.Interaction, message: str):
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     logger.exception("App command error")
-    # ユーザー向けメッセージ（詳細はログに）
     try:
         await interaction.response.send_message("コマンド実行中にエラーが発生しました。", ephemeral=True)
     except Exception:
-        # 既に応答済みの場合
         try:
             await interaction.followup.send("コマンド実行中にエラーが発生しました。", ephemeral=True)
         except Exception:
             pass
 
-# --- 起動時処理 ---
+# --- 起動時処理とコマンド同期 ---
+async def sync_commands():
+    guild_id = int(GUILD_ID) if GUILD_ID else None
+    try:
+        if guild_id:
+            # ギルドに参加しているか確認してから同期
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                logger.error("Bot is not a member of guild %s. Skipping guild sync.", guild_id)
+            else:
+                bot.tree.copy_global_to(guild=discord.Object(id=guild_id))
+                await bot.tree.sync(guild=discord.Object(id=guild_id))
+                logger.info("Commands synced to guild %s", guild_id)
+        else:
+            await bot.tree.sync()
+            logger.info("Global commands synced")
+    except discord.errors.Forbidden:
+        logger.exception("Failed to sync commands due to missing access")
+    except Exception:
+        logger.exception("Failed to sync commands")
+
 @bot.event
 async def on_ready():
-    logger.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    # ステータス設定（任意）
+    logger.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
     try:
         await bot.change_presence(activity=discord.Game(name="/totuzen"))
     except Exception:
         logger.warning("Failed to set presence")
-    # コマンド同期
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-            logger.info("Commands synced to guild: %s", GUILD_ID)
-        else:
-            await bot.tree.sync()
-            logger.info("Global commands synced")
-    except Exception:
-        logger.exception("Failed to sync commands")
+    # 同期は別タスクで行うと起動がブロックされにくい
+    asyncio.create_task(sync_commands())
 
 # --- Graceful shutdown for Render ---
 async def shutdown():
@@ -134,16 +143,16 @@ def _setup_signal_handlers(loop):
         try:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown()))
         except NotImplementedError:
-            # Windows 等で未サポートの場合は無視
             pass
 
 # --- エントリポイント ---
 if __name__ == "__main__":
     if not TOKEN:
-        logger.error("DISCORD_TOKEN が設定されていません。環境変数を確認してください。")
+        logger.error("DISCORD_TOKEN is not set. Exiting.")
         raise SystemExit(1)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     _setup_signal_handlers(loop)
     try:
         loop.run_until_complete(bot.start(TOKEN))
